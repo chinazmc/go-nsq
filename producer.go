@@ -25,28 +25,28 @@ type producerConn interface {
 // and will lazily connect to that instance (and re-connect)
 // when Publish commands are executed.
 type Producer struct {
-	id     int64
-	addr   string
-	conn   producerConn
-	config Config
+	id     int64        // 用于打印日志时标示实例。由instCount全局变量控制，从0开始，每创建一个Producer或Consumer时+1
+	addr   string       // 连接的Nsqd的地址
+	conn   producerConn // 连接实例
+	config Config       // 配置参数
 
 	logger   []logger
 	logLvl   LogLevel
 	logGuard sync.RWMutex
 
-	responseChan chan []byte
-	errorChan    chan []byte
-	closeChan    chan int
+	responseChan chan []byte // conn收到Nsqd生产成功的响应后，通过此chan告知router()，router再通知到生产消息的线程
+	errorChan    chan []byte // conn收到Nsqd错误信息的响应后，通过此chan告知router()，router再通知到生产消息的线程
+	closeChan    chan int    // conn断开时通过此chan告知router()结束
 
-	transactionChan chan *ProducerTransaction
-	transactions    []*ProducerTransaction
-	state           int32
+	transactionChan chan *ProducerTransaction // 生产过程将消息推送到这个chan，再异步接收成功的结果
+	transactions    []*ProducerTransaction    // 一个先入先出队列，用于router协程处理消息写入结果
+	state           int32                     // 连接状态，初始状态/连接断开/已连接
 
-	concurrentProducers int32
+	concurrentProducers int32 // 统计正在等待发往transactionChan的消息数，Producer在退出前会将这些消息置为ErrNotConnected
 	stopFlag            int32
 	exitChan            chan int
-	wg                  sync.WaitGroup
-	guard               sync.Mutex
+	wg                  sync.WaitGroup // 用于等待router()协程退出
+	guard               sync.Mutex     // Producer全局锁
 }
 
 // ProducerTransaction is returned by the async publish methods
@@ -70,16 +70,18 @@ func (t *ProducerTransaction) finish() {
 // The only valid way to create a Config is via NewConfig, using a struct literal will panic.
 // After Config is passed into NewProducer the values are no longer mutable (they are copied).
 func NewProducer(addr string, config *Config) (*Producer, error) {
+	//检查配置文件，是否初始化，验证是否成功
 	err := config.Validate()
 	if err != nil {
 		return nil, err
 	}
-
+	//实例化Producer
 	p := &Producer{
+		//id 自增1
 		id: atomic.AddInt64(&instCount, 1),
 
 		addr:   addr,
-		config: *config,
+		config: *config, //配置文件
 
 		logger: make([]logger, int(LogLevelMax+1)),
 		logLvl: LogLevelInfo,
@@ -104,6 +106,7 @@ func NewProducer(addr string, config *Config) (*Producer, error) {
 // This method can be used to verify that a newly-created Producer instance is
 // configured correctly, rather than relying on the lazy "connect on Publish"
 // behavior of a Producer.
+// Ping方法一般用于刚创建的Producer实例。自动connect()方法创建连接，并发送一条Nop指令，以确认连接是否正常
 func (w *Producer) Ping() error {
 	if atomic.LoadInt32(&w.state) != StateConnected {
 		err := w.connect()
@@ -170,6 +173,8 @@ func (w *Producer) String() string {
 // Stop initiates a graceful stop of the Producer (permanent)
 //
 // NOTE: this blocks until completion
+// Stop()方法用于优雅退出当前Producer。
+// 正在等待发送的消息将被置为ErrNotConnected或ErrStopped
 func (w *Producer) Stop() {
 	w.guard.Lock()
 	if !atomic.CompareAndSwapInt32(&w.stopFlag, 0, 1) {
@@ -190,6 +195,7 @@ func (w *Producer) Stop() {
 // the supplied `doneChan` (if specified)
 // will receive a `ProducerTransaction` instance with the supplied variadic arguments
 // and the response error if present
+//非阻塞发布1条消息。相比Publish()，多了一个额外的doneChan参数，通过此chan来异步接收发布结果。
 func (w *Producer) PublishAsync(topic string, body []byte, doneChan chan *ProducerTransaction,
 	args ...interface{}) error {
 	return w.sendCommandAsync(Publish(topic, body), doneChan, args)
@@ -202,6 +208,7 @@ func (w *Producer) PublishAsync(topic string, body []byte, doneChan chan *Produc
 // the supplied `doneChan` (if specified)
 // will receive a `ProducerTransaction` instance with the supplied variadic arguments
 // and the response error if present
+//非阻塞发布多条消息。通过doneChan来异步接收发布结果。
 func (w *Producer) MultiPublishAsync(topic string, body [][]byte, doneChan chan *ProducerTransaction,
 	args ...interface{}) error {
 	cmd, err := MultiPublish(topic, body)
@@ -213,12 +220,14 @@ func (w *Producer) MultiPublishAsync(topic string, body [][]byte, doneChan chan 
 
 // Publish synchronously publishes a message body to the specified topic, returning
 // an error if publish failed
+//阻塞发布1条消息。底层调用"PUB"指令
 func (w *Producer) Publish(topic string, body []byte) error {
 	return w.sendCommand(Publish(topic, body))
 }
 
 // MultiPublish synchronously publishes a slice of message bodies to the specified topic, returning
 // an error if publish failed
+//阻塞发布多条消息。底层调用"MPUB"指令
 func (w *Producer) MultiPublish(topic string, body [][]byte) error {
 	cmd, err := MultiPublish(topic, body)
 	if err != nil {
@@ -230,6 +239,7 @@ func (w *Producer) MultiPublish(topic string, body [][]byte) error {
 // DeferredPublish synchronously publishes a message body to the specified topic
 // where the message will queue at the channel level until the timeout expires, returning
 // an error if publish failed
+//阻塞发布1条带延时的消息。相比Publish()，多了一个delay参数来指定延时多久才推送给消费者。底层调用"DPUB"指令
 func (w *Producer) DeferredPublish(topic string, delay time.Duration, body []byte) error {
 	return w.sendCommand(DeferredPublish(topic, delay, body))
 }
@@ -242,22 +252,31 @@ func (w *Producer) DeferredPublish(topic string, delay time.Duration, body []byt
 // the supplied `doneChan` (if specified)
 // will receive a `ProducerTransaction` instance with the supplied variadic arguments
 // and the response error if present
+//非阻塞发布1条带延时的消息。通过doneChan来异步接收发布结果。
 func (w *Producer) DeferredPublishAsync(topic string, delay time.Duration, body []byte,
 	doneChan chan *ProducerTransaction, args ...interface{}) error {
 	return w.sendCommandAsync(DeferredPublish(topic, delay, body), doneChan, args)
 }
 
+//sendCommand()方法创建一个临时的doneChan来接收发布结果。
 func (w *Producer) sendCommand(cmd *Command) error {
+	//提前设置了一个接受返回参数的Chan, 这里有伏笔，埋伏它一手
 	doneChan := make(chan *ProducerTransaction)
+	//调用了sendCommandAsync 并且把doneChan 传进去了
 	err := w.sendCommandAsync(cmd, doneChan, nil)
 	if err != nil {
 		close(doneChan)
 		return err
 	}
+	//上面函数结束后，在这里苦苦的等待 doneChan的返回值，所以我们可以大胆的推测 sendCommandAsync 方法并不返回真实的值
 	t := <-doneChan
 	return t.Error
 }
 
+/**
+sendCommandAsync()负责将消息写入Producer.transactionChan。
+下一章节的router协程负责接收并将消息发往Nsqd，并将发布结果通过doneChan返回。如果连接尚未创建，这里会自动重建连接。
+*/
 func (w *Producer) sendCommandAsync(cmd *Command, doneChan chan *ProducerTransaction,
 	args []interface{}) error {
 	// keep track of how many outstanding producers we're dealing with
@@ -266,7 +285,7 @@ func (w *Producer) sendCommandAsync(cmd *Command, doneChan chan *ProducerTransac
 	defer atomic.AddInt32(&w.concurrentProducers, -1)
 
 	if atomic.LoadInt32(&w.state) != StateConnected {
-		err := w.connect()
+		err := w.connect() // 未连接时自动重建连接
 		if err != nil {
 			return err
 		}
@@ -279,7 +298,7 @@ func (w *Producer) sendCommandAsync(cmd *Command, doneChan chan *ProducerTransac
 	}
 
 	select {
-	case w.transactionChan <- t:
+	case w.transactionChan <- t: // 将消息发送给router协程
 	case <-w.exitChan:
 		return ErrStopped
 	}
@@ -287,6 +306,7 @@ func (w *Producer) sendCommandAsync(cmd *Command, doneChan chan *ProducerTransac
 	return nil
 }
 
+// 创建连接，修改连接状态，启动router()协程
 func (w *Producer) connect() error {
 	w.guard.Lock()
 	defer w.guard.Unlock()
@@ -339,20 +359,37 @@ func (w *Producer) close() {
 	}()
 }
 
+/**
+Producer通过起一个router协程异步发送和接收消息响应的方式来实现Producer并发写入的问题。无论用户有多少个线程在生产消息，
+最终都得调用sendCommandAsync()方法将消息写入一个chan，并由router单协程处理，这就避免了并发冲突。
+router协程在上文的Producer.connect()方法被启动。
+Router()方法起了个for循环持续监听几个chan，我们重点关注：
+
+transactionChan：所有消息最终均通过sendCommandAsync()方法写入这个chan。router协程负责将从transactionChan收到的消息，
+写入Producer.conn，并最终发送到Nsqd。
+responseChan：Nsqd每正确接收到一个消息，会响应一个确认帧回来。Producer.conn则通过此chan来告知router消息写入成功。
+errorChan：同responseChan，收到错误信息时，通过此chan告知router。
+无论是写入成功还是有错误，router协程均调用popTransaction()方法来处理。这个方法有个细节，Nsqd并没有告知写入成功或失败的消息是哪条，
+Producer又是怎么知道的呢？原理是底层使用的TCP通讯，同学们可以回想下TCP的特点，TCP是有序的。写入消息的只有router一个协程，
+所以消息是按顺序写入的，恰恰Nsqd端也是单线程处理同一个生产者。所以router收到的响应，必然是针对transactions队列中第1条消息的
+（这是一个用切片实现的先入先出队列，router会在写入conn的同时将消息写入这个队列）。
+
+收到Nsqd的响应后，router将结束写入ProducerTransaction.doneChan，用于通知消息的写入协程。
+*/
 func (w *Producer) router() {
 	for {
 		select {
-		case t := <-w.transactionChan:
-			w.transactions = append(w.transactions, t)
-			err := w.conn.WriteCommand(t.cmd)
+		case t := <-w.transactionChan: // 这是待发布的消息
+			w.transactions = append(w.transactions, t) // 先入先出队列，用于处理消息发布结果
+			err := w.conn.WriteCommand(t.cmd)          // 发布消息
 			if err != nil {
 				w.log(LogLevelError, "(%s) sending command - %s", w.conn.String(), err)
 				w.close()
 			}
-		case data := <-w.responseChan:
-			w.popTransaction(FrameTypeResponse, data)
-		case data := <-w.errorChan:
-			w.popTransaction(FrameTypeError, data)
+		case data := <-w.responseChan: // 发布成功的响应
+			w.popTransaction(FrameTypeResponse, data) // 处理发布结果，将结果写入doneChan
+		case data := <-w.errorChan: // 发布失败的响应
+			w.popTransaction(FrameTypeError, data) // 处理发布结果，将结果写入doneChan
 		case <-w.closeChan:
 			goto exit
 		case <-w.exitChan:
@@ -368,11 +405,11 @@ exit:
 
 func (w *Producer) popTransaction(frameType int32, data []byte) {
 	t := w.transactions[0]
-	w.transactions = w.transactions[1:]
+	w.transactions = w.transactions[1:] // 发布成功或失败的消息，出队
 	if frameType == FrameTypeError {
-		t.Error = ErrProtocol{string(data)}
+		t.Error = ErrProtocol{string(data)} // 发布失败的错误信息
 	}
-	t.finish()
+	t.finish() // 通知到doneChan
 }
 
 func (w *Producer) transactionCleanup() {

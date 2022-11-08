@@ -16,9 +16,9 @@ var MagicV2 = []byte("  V2")
 
 // frame types
 const (
-	FrameTypeResponse int32 = 0
-	FrameTypeError    int32 = 1
-	FrameTypeMessage  int32 = 2
+	FrameTypeResponse int32 = 0 //响应
+	FrameTypeError    int32 = 1 //错误
+	FrameTypeMessage  int32 = 2 //消息
 )
 
 var validTopicChannelNameRegex = regexp.MustCompile(`^[\.a-zA-Z0-9_-]+(#ephemeral)?$`)

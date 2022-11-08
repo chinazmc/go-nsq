@@ -26,6 +26,8 @@ import (
 // When the return value is nil Consumer will automatically handle FINishing.
 //
 // When the returned value is non-nil Consumer will automatically handle REQueing.
+// 返回nil表示消费成功，Consumer将向Nsqd发送FIN指令销毁消息。
+// 非nil表示消费失败或需要重复消费，Consumer将向Nsqd发送REQ指令将消息重新入队推送。
 type Handler interface {
 	HandleMessage(message *Message) error
 }
@@ -343,7 +345,7 @@ func (r *Consumer) ConnectToNSQLookupd(addr string) error {
 		return errors.New("consumer stopped")
 	}
 	if atomic.LoadInt32(&r.runningHandlers) == 0 {
-		return errors.New("no handlers")
+		return errors.New("no handlers") // 同ConnectToNSQD()，必须先注册回调
 	}
 
 	parsedAddr, err := buildLookupAddr(addr, r.topic)
@@ -360,7 +362,7 @@ func (r *Consumer) ConnectToNSQLookupd(addr string) error {
 			return nil
 		}
 	}
-	r.lookupdHTTPAddrs = append(r.lookupdHTTPAddrs, parsedAddr)
+	r.lookupdHTTPAddrs = append(r.lookupdHTTPAddrs, parsedAddr) // 将lookupd的addr加入到lookupdHTTPAddrs切片
 	if r.lookupdHttpClient == nil {
 		transport := &http.Transport{
 			DialContext: (&net.Dialer{
@@ -382,10 +384,11 @@ func (r *Consumer) ConnectToNSQLookupd(addr string) error {
 	r.mtx.Unlock()
 
 	// if this is the first one, kick off the go loop
+	// 只有第1个loopupd才会创建lookupdLoop协程。
 	if numLookupd == 1 {
-		r.queryLookupd()
+		r.queryLookupd() // 执行一次服务发现，里面最多重复3次，如果都失败了，也不影响程序继续运行
 		r.wg.Add(1)
-		go r.lookupdLoop()
+		go r.lookupdLoop() // 创建lookupdLoop协程完成自动的服务发现
 	}
 
 	return nil
@@ -513,6 +516,7 @@ retry:
 	if discoveryFilter, ok := r.behaviorDelegate.(DiscoveryFilter); ok {
 		nsqdAddrs = discoveryFilter.Filter(nsqdAddrs)
 	}
+	//进行连接
 	for _, addr := range nsqdAddrs {
 		err = r.ConnectToNSQD(addr)
 		if err != nil && err != ErrAlreadyConnected {
@@ -541,13 +545,19 @@ func (r *Consumer) ConnectToNSQDs(addresses []string) error {
 // It is recommended to use ConnectToNSQLookupd so that topics are discovered
 // automatically.  This method is useful when you want to connect to a single, local,
 // instance.
+/*
+ConnectToNSQD()方法比较长，关键的点是，如果未注册回调方法，会报错；置状态为已连接；
+新建一个连接，建立连接时会发送"IDENTIFY"指令通告此连接的相关参数；向Nsqd发送Sub指令开始订阅；
+订阅前连接暂时放在pendingConnections中，订阅成功后从pendingConnections移到connections中。
+ConnectToNSQD()最终对connections中所有连接执行maybeUpdateRDY()方法用于调整RDY计数。
+*/
 func (r *Consumer) ConnectToNSQD(addr string) error {
 	if atomic.LoadInt32(&r.stopFlag) == 1 {
 		return errors.New("consumer stopped")
 	}
 
 	if atomic.LoadInt32(&r.runningHandlers) == 0 {
-		return errors.New("no handlers")
+		return errors.New("no handlers") // 如果未注册回调方法，会报错
 	}
 
 	atomic.StoreInt32(&r.connectedFlag, 1)
@@ -938,6 +948,8 @@ exit:
 	r.wg.Done()
 }
 
+//当剩余的可用处理数量`remain`小于等于1，或者小于最后一次设置的可用数量`lastRdyCount`的1/4时,
+//或者可用连接平均的maxInFlight大于0并且小于`remain`时，则更新`RDY`状态
 func (r *Consumer) updateRDY(c *Conn, count int64) error {
 	if c.IsClosing() {
 		return ErrClosing
@@ -1112,6 +1124,8 @@ func (r *Consumer) stopHandlers() {
 // This panics if called after connecting to NSQD or NSQ Lookupd
 //
 // (see Handler or HandlerFunc for details on implementing this interface)
+// 必须在Consumer连接之前调用AddHandler()方法，否则会抛panic
+// 每调用一次AddHandler()就创建一个handlerLoop协程，可以多次调用来创建多个协程
 func (r *Consumer) AddHandler(handler Handler) {
 	r.AddConcurrentHandlers(handler, 1)
 }
@@ -1125,12 +1139,12 @@ func (r *Consumer) AddHandler(handler Handler) {
 // (see Handler or HandlerFunc for details on implementing this interface)
 func (r *Consumer) AddConcurrentHandlers(handler Handler, concurrency int) {
 	if atomic.LoadInt32(&r.connectedFlag) == 1 {
-		panic("already connected")
+		panic("already connected") // 必须在Consumer连接之前调用AddHandler()方法，否则会抛panic
 	}
 
 	atomic.AddInt32(&r.runningHandlers, int32(concurrency))
 	for i := 0; i < concurrency; i++ {
-		go r.handlerLoop(handler)
+		go r.handlerLoop(handler) // 每调用一次AddHandler()就创建一个handlerLoop协程，可以多次调用来创建多个协程
 	}
 }
 
@@ -1138,6 +1152,7 @@ func (r *Consumer) handlerLoop(handler Handler) {
 	r.log(LogLevelDebug, "starting Handler")
 
 	for {
+		// 可以创建多个协程并发监听这个channel
 		message, ok := <-r.incomingMessages
 		if !ok {
 			goto exit
